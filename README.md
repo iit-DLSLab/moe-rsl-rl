@@ -34,3 +34,7 @@ If you find the work useful, please consider citing one of our works:
   doi={arXiv:2606.25965}
 }
 ```
+
+## Maintainer
+
+This repository is maintained by [Giulio Turrisi](https://github.com/giulioturrisi)
