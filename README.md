@@ -30,7 +30,7 @@ See [here](https://github.com/iit-DLSLab/morphosymm-rl/blob/feature/main/README_
 
 ## Citing this work
 
-If you find the work useful, please consider citing one of our works:
+If you find the work useful, please consider citing:
 
 #### [Mixture-of-Experts RL for Fault-Tolerant Legged Locomotion (ArXiv)](https://arxiv.org/abs/2606.25965)
 
