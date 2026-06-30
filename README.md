@@ -31,6 +31,6 @@ If you find the work useful, please consider citing one of our works:
   booktitle={arXiv}, 
   title={Mixture-of-Experts RL for Fault-Tolerant Legged Locomotion}, 
   year={2026},
-  doi={	arXiv:2606.25965}
+  doi={arXiv:2606.25965}
 }
 ```
