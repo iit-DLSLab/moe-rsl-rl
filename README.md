@@ -6,6 +6,14 @@
 # moe-rsl-rl
 moe-rsl-rl is a reinforcement learning library that extends the Proximal Policy Optimization (PPO) implementation of [RSL-RL](https://github.com/leggedrobotics/rsl_rl) to incorporate [Mixture-of-Expert](https://www.cs.toronto.edu/~fritz/absps/jjnh91.pdf) (MoE).
 
+Features:
+
+- explicit expert selection
+- dense gating
+- sparse gating
+- top-k
+- shared-slayers between experts
+
 
 ## Installation
 
