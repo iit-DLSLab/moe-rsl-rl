@@ -10,6 +10,12 @@ This guide explains what is inside this repository and how to wire it into an Is
 
 The key idea is that `moe-rsl-rl` does not define an IsaacLab task. It extends the RSL-RL PPO training stack with Mixture-of-Experts actor/critic modules and a local PPO fork that knows how to handle the extra MoE losses and distributions.
 
+
+## Minimal Config Skeleton to add in your isaaclab!
+
+See in the folder example!
+
+
 ## Repository Layout
 
 ```text
@@ -243,7 +249,3 @@ For shared expert layouts:
 - `use_shared_layers="backbone+head"` shares the early layers and final action/value head.
 
 When using `"backbone"` or `"backbone+head"`, use at least two hidden dimensions so the shared backbone and expert head have valid layer sizes.
-
-## Minimal Config Skeleton
-
-See in the folder example.
