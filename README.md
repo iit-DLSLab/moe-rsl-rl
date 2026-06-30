@@ -13,7 +13,7 @@ Features:
 - dense gating
 - sparse gating
 - top-k
-- shared-slayers between experts
+- shared-layers between experts
 
 
 ## Installation
