@@ -9,6 +9,7 @@ moe-rsl-rl is a reinforcement learning library that extends the Proximal Policy 
 Features:
 
 - explicit expert selection
+- explicit expert with different action size
 - dense gating
 - sparse gating
 - top-k
