@@ -135,9 +135,9 @@ In your IsaacLab training script, use the runner in `moe_rsl_rl/runners/moe_on_p
 In this checkout, the runner file still uses a stale class name from the source it was adapted from:
 
 ```python
-from moe_rsl_rl.runners.moe_on_policy_runner import SymmOnPolicyRunner
+from moe_rsl_rl.runners.moe_on_policy_runner import MoEOnPolicyRunner
 
-runner = SymmOnPolicyRunner(env, train_cfg, log_dir=log_dir, device=device)
+runner = MoEOnPolicyRunner(env, train_cfg, log_dir=log_dir, device=device)
 ```
 
 If your branch renames the class to `MoEOnPolicyRunner`, use that name consistently in the runner file, `moe_rsl_rl/runners/__init__.py`, and your training script.

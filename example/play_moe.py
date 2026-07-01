@@ -76,7 +76,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 #from rsl_rl.runners import on_policy_runner
-from moe_rsl_rl.runners.moe_on_policy_runner import MoeOnPolicyRunner
+from moe_rsl_rl.runners.moe_on_policy_runner import MoEOnPolicyRunner
 # Import extensions to set up environment tasks
 import mixture_of_expert_recovery_isaaclab.tasks  # noqa: F401
 
@@ -140,7 +140,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    runner = MoeOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    runner = MoEOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     runner.load(resume_path)
 
     # obtain the trained policy for inference

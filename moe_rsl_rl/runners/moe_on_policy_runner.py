@@ -24,11 +24,11 @@ from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups
 from rsl_rl.utils.logger import Logger
 
-from moe_rl.modules.ac_moe import ActorCriticMoE
-from moe_rl.algorithms.ppo import PPO
+from moe_rsl_rl.modules.ac_moe import ActorCriticMoE
+from moe_rsl_rl.algorithms.ppo import PPO
 
 
-class SymmOnPolicyRunner:
+class MoEOnPolicyRunner:
     """On-policy runner for training and evaluation of actor-critic methods."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:

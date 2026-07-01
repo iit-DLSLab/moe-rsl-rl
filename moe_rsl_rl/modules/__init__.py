@@ -8,14 +8,10 @@
 from .ac_moe import ActorCriticMoE, MoE_net
 from .ac_moe_explicit import ExplicitExpertMoENet
 from .ac_moe_gated import GatedMoENet
-from .ac_symm import ActorCriticSymm
-from .normalizer import EquivEmpiricalNormalization
 
 __all__ = [
     "ActorCriticMoE",
     "MoE_net",
     "ExplicitExpertMoENet",
     "GatedMoENet",
-    "ActorCriticSymm",
-    "EquivEmpiricalNormalization",
 ]
