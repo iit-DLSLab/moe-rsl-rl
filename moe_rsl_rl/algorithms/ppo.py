@@ -208,14 +208,17 @@ class PPO(RslRlPPO):
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
         """Load a v5 checkpoint or migrate the model weights from the former v3 checkpoint layout."""
+        # A v5 checkpoint already has separate actor/critic state dicts; delegate directly
         if "model_state_dict" not in loaded_dict:
             return super().load(loaded_dict, load_cfg, strict)
 
+        # A v3 checkpoint stores one monolithic ActorCriticMoE state; split it into the v5 layout
         actor_state, critic_state = self._split_legacy_policy_state(loaded_dict["model_state_dict"])
         converted_dict = loaded_dict.copy()
         converted_dict["actor_state_dict"] = actor_state
         converted_dict["critic_state_dict"] = critic_state
 
+        # The optimizer's parameter layout changed between v3 and v5, so it cannot be restored
         if load_cfg is None:
             load_cfg = {
                 "actor": True,
@@ -240,6 +243,7 @@ class PPO(RslRlPPO):
         """Convert a monolithic v3 ActorCriticMoE state into separate v5 actor and critic states."""
         actor_state: dict[str, torch.Tensor] = {}
         critic_state: dict[str, torch.Tensor] = {}
+        # Re-key every v3 parameter under its v5 module path (actor/critic MLPModel wraps the MoE in `mlp.`)
         for name, value in state_dict.items():
             if name.startswith("actor."):
                 actor_state[f"mlp.{name.removeprefix('actor.')}"] = value

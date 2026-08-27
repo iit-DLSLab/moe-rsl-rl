@@ -35,6 +35,7 @@ def MoE_net(
     expert_output_dims: list[int] | None = None,
 ) -> BaseMoENet:
     """Build either a learned-gate or explicitly routed MoE network."""
+    # Hard routing: the expert index comes from the observation, no learned gate is built
     if use_explicit_expert:
         return ExplicitExpertMoENet(
             obs_dim=obs_dim,
@@ -51,6 +52,7 @@ def MoE_net(
     if expert_output_dims is not None:
         raise ValueError("`expert_output_dims` is supported only with `use_explicit_expert=True`.")
 
+    # Soft routing: a learned gate produces the mixture weights over experts
     return GatedMoENet(
         obs_dim=obs_dim,
         act_dim=act_dim,
@@ -84,12 +86,14 @@ class MoEDistribution(Distribution):
         object.__setattr__(self, "_moe", moe)
         self.std_type = std_type
         self.std_range = (max(float(std_range[0]), 1.0e-6), float(std_range[1]))
+        # Precompute the log-space bounds so `log` std parameters can be clamped without repeated log() calls
         self.log_std_range = (
             float(torch.log(torch.tensor(self.std_range[0]))),
             float(torch.log(torch.tensor(self.std_range[1]))),
         )
         self.use_gaussian_mixture = use_gaussian_mixture
 
+        # One standard deviation vector per expert, learned jointly with the policy
         shape = (moe.num_experts, output_dim)
         if std_type == "scalar":
             self.std_param = nn.Parameter(init_std * torch.ones(shape), requires_grad=learn_std)
@@ -100,6 +104,7 @@ class MoEDistribution(Distribution):
         else:
             raise ValueError(f"Unknown standard deviation type: {std_type}. Should be 'scalar' or 'log'.")
 
+        # Populated by `update()` after every forward pass, once the router weights are known
         self._distribution: Normal | MaskedActionNormal | DiagonalGaussianMixture | None = None
         Normal.set_default_validate_args(False)
 
@@ -120,6 +125,8 @@ class MoEDistribution(Distribution):
         """Update the action distribution from the latest MoE forward pass."""
         expert_std = self._expert_std(mlp_output.shape[0])
 
+        # Gaussian-mixture mode keeps every expert as a separate mixture component instead of
+        # collapsing the outputs into a single mean, so the action distribution is multi-modal.
         if self.use_gaussian_mixture:
             component_means = self.moe._last_component_outputs.transpose(1, 2)
             component_action_masks = self.moe.expert_action_masks if self.moe.has_variable_expert_outputs else None
@@ -133,15 +140,18 @@ class MoEDistribution(Distribution):
 
         action_mask: torch.Tensor | None = None
         if self.moe.use_explicit_expert:
+            # Hard routing already collapsed the mean to the selected expert; pick the matching std
             selector = self.moe._last_gate_weights.squeeze(1).argmax(dim=-1)
             batch_idx = torch.arange(mlp_output.shape[0], device=mlp_output.device)
             std = expert_std[batch_idx, selector]
             if self.moe.has_variable_expert_outputs:
                 action_mask = self.moe.expert_action_masks.index_select(0, selector).to(dtype=mlp_output.dtype)
         else:
+            # Soft routing: blend the per-expert std by the same gate weights used for the mean
             weights = self.moe._last_gate_weights.squeeze(1)
             std = (weights.unsqueeze(-1) * expert_std).sum(dim=1)
 
+        # Fall back to a plain Normal when every expert controls the full action vector
         if action_mask is None:
             self._distribution = Normal(mlp_output, std)
         else:
@@ -196,6 +206,7 @@ class MoEDistribution(Distribution):
         """Compute diagonal-Gaussian KL while ignoring inactive action dimensions."""
         old_mean, old_std = old_params
         new_mean, new_std = new_params
+        # A zero std marks a masked-out action dimension for a given sample; exclude it from the KL
         active_dims = (old_std > 0.0) & (new_std > 0.0)
         old_std = old_std.clamp_min(1.0e-6)
         new_std = new_std.clamp_min(1.0e-6)
@@ -203,6 +214,7 @@ class MoEDistribution(Distribution):
         log_std_ratio = (
             torch.log(std_ratio) if self.moe.has_variable_expert_outputs else torch.log(std_ratio + 1.0e-5)
         )
+        # Standard closed-form KL between two diagonal Gaussians, summed over active dimensions only
         kl = (
             log_std_ratio
             + (old_std.square() + (old_mean - new_mean).square()) / (2.0 * new_std.square())
@@ -236,12 +248,15 @@ class MoEModel(MLPModel):
         use_gaussian_mixture: bool = False,
     ) -> None:
         """Initialize an actor or critic MoE model."""
+        # Skip MLPModel.__init__: it builds a plain MLP, whereas here `self.mlp` is a MoE network
         nn.Module.__init__(self)
 
+        # Resolve the observation groups feeding this model (actor or critic) and their flattened size
         self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
         self.obs_normalization = obs_normalization
         self.obs_normalizer = EmpiricalNormalization(self.obs_dim) if obs_normalization else nn.Identity()
 
+        # Build the expert network, keeping the RSL-RL `self.mlp` attribute name so export utilities work
         self.mlp = MoE_net(
             obs_dim=self.obs_dim,
             act_dim=output_dim,
@@ -257,6 +272,7 @@ class MoEModel(MLPModel):
             expert_output_dims=expert_output_dims,
         )
 
+        # Record which auxiliary PPO losses and KL/log-prob strategies apply to this model
         self.use_gate_loss = use_gate_loss
         self.use_load_balance_loss = use_load_balance_loss and not use_explicit_expert
         self.use_gaussian_mixture = use_gaussian_mixture
@@ -264,6 +280,7 @@ class MoEModel(MLPModel):
         self.use_masked_action_kl = self.use_variable_expert_outputs and not use_gaussian_mixture
         self.use_log_prob_kl = use_gaussian_mixture
 
+        # A critic has no distribution config; only a stochastic actor builds a MoE-aware distribution
         if distribution_cfg is None:
             if use_gaussian_mixture:
                 raise ValueError("`use_gaussian_mixture=True` is valid only for a stochastic actor model.")
