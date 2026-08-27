@@ -20,6 +20,7 @@ class ExplicitExpertMoENet(BaseMoENet):
         use_shared_layers="None",
         expert_output_dims: list[int] | None = None,
     ):
+        # Build the same expert topology while reserving the final observation as selector
         super().__init__(
             obs_dim=obs_dim,
             act_dim=act_dim,
@@ -30,6 +31,7 @@ class ExplicitExpertMoENet(BaseMoENet):
             use_shared_layers=use_shared_layers,
             expert_output_dims=expert_output_dims,
         )
+        # Preserve the gate-entropy option for compatibility with the previous implementation
         self.use_gate_loss = use_gate_loss
         # Explicit routing does not optimize gate balancing.
         self.use_load_balance_loss = False
@@ -37,19 +39,23 @@ class ExplicitExpertMoENet(BaseMoENet):
         self.is_sparse = False
 
     def _gate_explicit(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert the last observation entry into one-hot routing weights
         selector_vals = x[:, -1].round().long().clamp(0, self.num_experts - 1)
         weights = torch.zeros(x.shape[0], self.num_experts, device=x.device)
         weights.scatter_(1, selector_vals.unsqueeze(1), 1.0)
         return weights.unsqueeze(1)
 
     def forward(self, x: torch.Tensor, return_gate: bool = False) -> torch.Tensor:
+        # Evaluate all expert components and select exactly one output per environment
         expert_out, _ = self._compute_experts(x)
         weights = self._gate_explicit(x)
 
+        # Cache routing and component outputs for the MoE-aware action distribution
         self._last_gate_weights = weights
         component_out = self._component_outputs(expert_out)
         self._last_component_outputs = component_out
         return self._combine_direct(component_out, weights)
 
     def load_balance_loss(self) -> torch.Tensor:
+        # Explicit routing has no trainable router to balance
         return torch.zeros((), device=self._last_gate_weights.device)

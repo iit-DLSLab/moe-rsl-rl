@@ -4,9 +4,9 @@ This guide explains what is inside this repository and how to wire it into an Is
 
 1. Install this package in the same Python environment you use for IsaacLab.
 2. Replace the standard RSL-RL runner with the MoE runner from this repository.
-3. Set the policy class to `ActorCriticMoE`.
+3. Configure the standard RSL-RL v5 `actor` and `critic` models.
 4. Add a top-level `moe_cfg` block to your training config.
-5. Choose whether experts are selected by a learned gate or by an explicit expert id in the observation.
+5. Select the MoE side with `moe_cfg.who` and choose learned or explicit routing.
 
 The key idea is that `moe-rsl-rl` does not define an IsaacLab task. It extends the RSL-RL PPO training stack with Mixture-of-Experts actor/critic modules and a local PPO fork that knows how to handle the extra MoE losses and distributions.
 
@@ -23,15 +23,15 @@ moe_rsl_rl/
   algorithms/
     ppo.py                    # Local PPO fork with MoE auxiliary losses and MoE-aware KL handling.
   modules/
-    ac_moe.py                 # ActorCriticMoE and the MoE factory.
+    ac_moe.py                 # RSL-RL v5 MoEModel, distribution, and network factory.
     ac_moe_common.py          # Shared expert helpers, masking, and Gaussian-mixture distributions.
     ac_moe_gated.py           # Learned-gate MoE network, with optional top-k sparse routing.
     ac_moe_explicit.py        # Hard-routed MoE network using the last observation entry as expert id.
   runners/
-    moe_on_policy_runner.py   # IsaacLab/RSL-RL runner that constructs ActorCriticMoE and local PPO.
+    moe_on_policy_runner.py   # Upstream v5.4.2 runner with local PPO selection for MoE configs.
 example/
   moe_cfg.py                  # Example MoE configuration.
-  rsl_rl_ppo_cfg.py           # Example IsaacLab RSL-RL PPO runner config using ActorCriticMoE.
+  rsl_rl_ppo_cfg.py           # Example RSL-RL v5 actor/critic and PPO configuration.
 README.md                    # Project overview.
 pyproject.toml               # Package metadata and dependencies.
 ```
@@ -46,9 +46,9 @@ At runtime the flow is:
 ```text
 IsaacLab VecEnv
   -> MoE on-policy runner
-    -> ActorCriticMoE
-      -> learned-gate MoE, explicit-expert MoE, or regular MLP per actor/critic side
     -> local PPO
+      -> separate actor and critic models (RSL-RL v5 API)
+      -> learned-gate MoE, explicit-expert MoE, or regular MLP per side
       -> standard PPO loss
       -> optional gate-entropy and load-balancing auxiliary losses
 ```
@@ -57,7 +57,8 @@ The runner expects a training config with these top-level sections:
 
 ```python
 train_cfg = {
-    "policy": {...},
+    "actor": {...},
+    "critic": {...},
     "algorithm": {...},
     "obs_groups": {...},
     "num_steps_per_env": ...,
@@ -69,9 +70,9 @@ train_cfg = {
 
 The important parts are:
 
-- `policy["class_name"] == "ActorCriticMoE"` enables the MoE actor-critic.
-- `algorithm["class_name"] == "PPO"` follows the usual RSL-RL config shape.
-- `moe_cfg` is passed into `ActorCriticMoE`.
+- `actor` and `critic` use the standard RSL-RL v5 model configuration shape.
+- `algorithm["class_name"] == "PPO"` selects this package's RSL-RL 5.4.2-compatible PPO in the MoE runner.
+- `moe_cfg["who"]` makes the actor, critic, or both use `MoEModel`.
 
 ## Choose a Workflow
 
@@ -132,21 +133,23 @@ If `who` includes `actor`, the actor observation must end with the expert id. If
 
 In your IsaacLab training script, use the runner in `moe_rsl_rl/runners/moe_on_policy_runner.py` instead of the standard RSL-RL on-policy runner.
 
-In this checkout, the runner file still uses a stale class name from the source it was adapted from:
-
 ```python
 from moe_rsl_rl.runners.moe_on_policy_runner import MoEOnPolicyRunner
 
 runner = MoEOnPolicyRunner(env, train_cfg, log_dir=log_dir, device=device)
 ```
 
-If your branch renames the class to `MoEOnPolicyRunner`, use that name consistently in the runner file, `moe_rsl_rl/runners/__init__.py`, and your training script.
+The runner is kept aligned with RSL-RL 5.4.2. Its MoE-specific behavior is deliberately limited to:
 
-The runner does three MoE-specific things:
+- selecting this repository's local `PPO` when a top-level `moe_cfg` is present
+- exposing the class as `MoEOnPolicyRunner`
 
-- stores the top-level `moe_cfg`
-- constructs `ActorCriticMoE` when `policy["class_name"] == "ActorCriticMoE"`
-- uses this repository's local `PPO`, which includes MoE auxiliary loss handling
+The local PPO constructs `MoEModel` on the sides selected by `who` and retains the standard v5 runner lifecycle,
+checkpoint format, logging, multi-GPU support, and JIT/ONNX entry points.
+
+Checkpoints written by this version use the RSL-RL v5 `actor_state_dict`/`critic_state_dict` layout. Loading an older
+v3 `model_state_dict` is supported for model weights and iteration count; its PPO optimizer is reinitialized because
+the v5 parameter layout is different.
 
 ## Configure Mixture of Experts
 
@@ -193,7 +196,7 @@ actor+critic   # MoE actor and MoE critic
 
 Use `"actor"` when you mainly want specialized policies with a conventional value function. Use `"critic"` when value estimation needs specialization but the action policy should remain a regular MLP. Use `"actor+critic"` when both sides should specialize.
 
-The code checks whether the string contains `"actor"` and/or `"critic"`, so prefer the explicit values above instead of inventing synonyms such as `"both"`.
+These are the only accepted values; synonyms such as `"both"` are rejected.
 
 ## Set the Expert Routing Input
 
@@ -215,11 +218,11 @@ The code rounds the value and clamps it into range. Keep it as a clean scalar in
 
 If only the actor is MoE, append the selector only to the actor/policy observation. If only the critic is MoE, append it only to the critic observation. If both are MoE, append it to both.
 
-## Supported MoE and PPO Settings
+## Supported Model Settings
 
-`ActorCriticMoE` supports the usual actor-critic policy settings plus MoE settings.
-
-.
+`MoEModel` supports the RSL-RL v5 MLP settings `hidden_dims`, `activation`, and `obs_normalization`. A stochastic MoE
+actor currently requires `GaussianDistribution`; its `init_std`, `std_type`, `std_range`, and `learn_std` options are
+supported. The v5 heteroscedastic and beta distributions are not MoE-enabled. The critic remains deterministic.
 
 ## Match Config to Tensor Dimensions
 

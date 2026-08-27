@@ -24,6 +24,7 @@ class GatedMoENet(BaseMoENet):
         use_load_balance_loss: bool = False,
         use_shared_layers="None",
     ):
+        # Build the expert topology shared with the explicit-routing implementation
         super().__init__(
             obs_dim=obs_dim,
             act_dim=act_dim,
@@ -34,11 +35,13 @@ class GatedMoENet(BaseMoENet):
             use_shared_layers=use_shared_layers,
             expert_output_dims=None,
         )
+        # Record which routing regularizers PPO should apply
         self.use_gate_loss = use_gate_loss
         self.use_load_balance_loss = use_load_balance_loss
         self.top_k = -1 if top_k is None else int(top_k)
         self.is_sparse = 0 < self.top_k < self.num_experts
 
+        # Build a router from either raw observations or shared backbone features
         act = resolve_nn_activation(activation)
         gate_layers = []
         gate_hidden_dims = gate_hidden_dims or []
@@ -51,30 +54,36 @@ class GatedMoENet(BaseMoENet):
         self.softmax = nn.Softmax(dim=-1)
 
     def _gate_dense(self, gate_input: torch.Tensor) -> torch.Tensor:
+        # Normalize all expert logits when dense routing is enabled
         gate_logits = self.gate(gate_input)
         full_weights = self.softmax(gate_logits)
         self._last_unmasked_gate_weights = full_weights
         return full_weights.unsqueeze(1)
 
     def _gate_sparse(self, gate_input: torch.Tensor) -> torch.Tensor:
+        # Compute full router probabilities before restricting dispatch to the top-k experts
         gate_logits = self.gate(gate_input)
         self._last_unmasked_gate_weights = self.softmax(gate_logits)
 
+        # Mask non-selected logits, then renormalize over the selected experts
         topk_vals, topk_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
         masked_logits = torch.full_like(gate_logits, -1e9)
         masked_logits.scatter_(dim=-1, index=topk_idx, src=topk_vals)
         full_weights = self.softmax(masked_logits)
 
+        # Cache the probabilities used for dispatch and auxiliary balancing
         self._last_unmasked_gate_weights = full_weights
         return full_weights.unsqueeze(1)
 
     def forward(self, x: torch.Tensor, return_gate: bool = False) -> torch.Tensor:
+        # Evaluate the experts and choose dense or sparse routing
         expert_out, gate_input = self._compute_experts(x)
         if self.is_sparse:
             weights = self._gate_sparse(gate_input)
         else:
             weights = self._gate_dense(gate_input)
 
+        # Cache component data needed by the policy distribution and PPO losses
         self._last_gate_weights = weights
         component_out = self._component_outputs(expert_out)
         self._last_component_outputs = component_out
@@ -83,6 +92,7 @@ class GatedMoENet(BaseMoENet):
     def load_balance_loss(self) -> torch.Tensor:
         n_experts = self.num_experts
 
+        # Sparse routing balances both expert assignment frequency and router probability
         if self.is_sparse:
             router_probs = self._last_unmasked_gate_weights.squeeze(1)
             expert_indices = router_probs.argmax(dim=-1)
@@ -92,6 +102,7 @@ class GatedMoENet(BaseMoENet):
             p = router_probs.mean(dim=0)
             return n_experts * (f * p).sum()
 
+        # Dense routing minimizes divergence between average utilization and a uniform target
         w = self._last_gate_weights.squeeze(1)
         mean_w = w.mean(dim=0)
         uniform = torch.full_like(mean_w, 1.0 / n_experts)
