@@ -16,7 +16,7 @@ from rsl_rl.modules.distribution import Distribution, GaussianDistribution
 from rsl_rl.utils import resolve_callable
 
 from .ac_moe_common import BaseMoENet, DiagonalGaussianMixture, MaskedActionNormal
-from .ac_moe_explicit import ExplicitExpertMoENet
+from .ac_moe_explicit import ExplicitExpertMoENet, _ExplicitExpertOnnxModel
 from .ac_moe_gated import GatedMoENet
 
 
@@ -306,22 +306,29 @@ class MoEModel(MLPModel):
         """Return the load-balancing loss from the MoE router."""
         return self.mlp.load_balance_loss()
 
-    def _export_with_cleared_router_cache(self, export_method: str, *args) -> nn.Module:
-        """Build an export wrapper without deep-copying tensors from the latest autograd graph."""
+    def _export_with_cleared_router_cache(self, build_fn) -> nn.Module:
+        """Run `build_fn` without deep-copying tensors from the latest autograd graph."""
         cache_names = ("_last_gate_weights", "_last_unmasked_gate_weights", "_last_component_outputs")
         cached_tensors = {name: getattr(self.mlp, name) for name in cache_names}
         try:
             for name, value in cached_tensors.items():
                 setattr(self.mlp, name, value.new_empty(0))
-            return getattr(super(), export_method)(*args)
+            return build_fn()
         finally:
             for name, value in cached_tensors.items():
                 setattr(self.mlp, name, value)
 
     def as_jit(self) -> nn.Module:
         """Return a TorchScript-compatible deterministic MoE policy."""
-        return self._export_with_cleared_router_cache("as_jit")
+        parent_as_jit = super().as_jit
+        return self._export_with_cleared_router_cache(parent_as_jit)
 
     def as_onnx(self, verbose: bool) -> nn.Module:
         """Return an ONNX-compatible deterministic MoE policy."""
-        return self._export_with_cleared_router_cache("as_onnx", verbose)
+        if isinstance(self.mlp, ExplicitExpertMoENet):
+            # Explicit routing only ever needs one expert per sample: export a batch-size-1
+            # graph that conditionally dispatches to the selected expert instead of the
+            # dense all-experts path used for training and for `as_jit`.
+            return self._export_with_cleared_router_cache(lambda: torch.jit.script(_ExplicitExpertOnnxModel(self)))
+        parent_as_onnx = super().as_onnx
+        return self._export_with_cleared_router_cache(lambda: parent_as_onnx(verbose))
