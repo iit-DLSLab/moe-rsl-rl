@@ -5,12 +5,13 @@
 
 """Definitions for neural-network components for RL-agents."""
 
-from .ac_moe import ActorCriticMoE, MoE_net
+from .ac_moe import MoEDistribution, MoEModel, MoE_net
 from .ac_moe_explicit import ExplicitExpertMoENet
 from .ac_moe_gated import GatedMoENet
 
 __all__ = [
-    "ActorCriticMoE",
+    "MoEModel",
+    "MoEDistribution",
     "MoE_net",
     "ExplicitExpertMoENet",
     "GatedMoENet",
