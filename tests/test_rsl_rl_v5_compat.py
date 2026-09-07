@@ -126,6 +126,75 @@ def run_update(algorithm: PPO, env: DummyEnv) -> dict[str, float]:
 class TestRslRlV5Compatibility(unittest.TestCase):
     """Regression coverage for the RSL-RL 5.4.2 integration."""
 
+    def test_pcgrad_projection(self) -> None:
+        gradients = torch.tensor([[1.0, 0.0], [-1.0, 1.0]])
+        torch.testing.assert_close(PPO._project_conflicting_gradients(gradients), torch.tensor([0.5, 1.5]))
+        for gradients in (
+            torch.tensor([[1.0, 0.0], [2.0, 1.0]]),
+            torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+            torch.tensor([[1.0, 2.0]]),
+        ):
+            torch.testing.assert_close(PPO._project_conflicting_gradients(gradients), gradients.sum(0))
+
+    def test_pcgrad_updates_shared_models(self) -> None:
+        env = DummyEnv()
+        for who in ("actor", "critic", "actor+critic"):
+            for sharing in ("backbone", "backbone+head"):
+                with self.subTest(who=who, sharing=sharing):
+                    cfg = make_cfg(who, explicit=True)
+                    cfg["moe_cfg"].update(use_shared_layers=sharing, use_pcgrad=True)
+                    algorithm = build_algorithm(env, cfg)
+                    self.assertTrue(algorithm.use_pcgrad)
+                    models = [m for m in (algorithm.actor, algorithm.critic) if isinstance(m, MoEModel)]
+                    before = [copy.deepcopy(model.state_dict()) for model in models]
+                    losses = run_update(algorithm, env)
+                    self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in losses.values()))
+                    for model, old in zip(models, before):
+                        for prefix in ("mlp.shared_backbone", "mlp.experts.0", "mlp.experts.1", "mlp.experts.2"):
+                            self.assertTrue(any(
+                                not torch.equal(parameter, old[name])
+                                for name, parameter in model.named_parameters() if name.startswith(prefix)
+                            ))
+
+    def test_pcgrad_preserves_head_gradients(self) -> None:
+        env = DummyEnv()
+        cfg = make_cfg("actor", explicit=True)
+        cfg["moe_cfg"].update(use_shared_layers="backbone", use_pcgrad=True)
+        algorithm = build_algorithm(env, cfg)
+        model = algorithm.actor
+        output = model(env.get_observations(), stochastic_output=False)
+        sample_losses = output.square().mean(-1)
+        ids = model.mlp._last_gate_weights.squeeze(1).argmax(-1)
+        # A minibatch containing just one expert must keep its ordinary gradient.
+        single_expert = ids == 0
+        for _, correction in algorithm._pcgrad_correction(
+            model, sample_losses[single_expert], ids[single_expert]
+        ):
+            torch.testing.assert_close(correction, torch.zeros_like(correction))
+        corrections = algorithm._pcgrad_correction(model, sample_losses, ids)
+        # Include an auxiliary term to verify the correction preserves its gradient too.
+        auxiliary = 0.1 * sum(p.square().sum() for p in model.mlp.shared_backbone.parameters())
+        (sample_losses.mean() + auxiliary).backward()
+        heads = [p for p in model.mlp.experts.parameters()]
+        old_heads = [p.grad.clone() for p in heads]
+        old_backbone = [p.grad.clone() for p, _ in corrections]
+        for parameter, correction in corrections:
+            parameter.grad.add_(correction.view_as(parameter))
+        for parameter, old in zip(heads, old_heads):
+            torch.testing.assert_close(parameter.grad, old)
+        for (parameter, correction), old in zip(corrections, old_backbone):
+            torch.testing.assert_close(parameter.grad, old + correction.view_as(parameter))
+
+    def test_pcgrad_rejects_unsupported_topologies(self) -> None:
+        for explicit, sharing in ((False, "backbone"), (True, False)):
+            cfg = make_cfg(explicit=explicit)
+            cfg["moe_cfg"].update(use_shared_layers=sharing, use_pcgrad=True)
+            with self.assertRaisesRegex(ValueError, "explicit routing and a shared backbone"):
+                build_algorithm(DummyEnv(), cfg)
+
+    def test_pcgrad_defaults_to_disabled(self) -> None:
+        self.assertFalse(build_algorithm(DummyEnv(), make_cfg()).use_pcgrad)
+
     def test_local_ppo_extends_upstream_ppo(self) -> None:
         self.assertTrue(issubclass(PPO, RslRlPPO))
         self.assertTrue(issubclass(MoEOnPolicyRunner, OnPolicyRunner))

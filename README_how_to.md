@@ -250,5 +250,12 @@ For shared expert layouts:
 - `use_shared_layers=False` gives each expert its own MLP.
 - `use_shared_layers="backbone"` shares the early layers, then gives each expert its own head.
 - `use_shared_layers="backbone+head"` shares the early layers and final action/value head.
+- `use_pcgrad=True` in `moe_cfg` enables PCGrad on each MoE model's shared backbone; the default is `False`.
+  It requires explicit routing and either shared-layer mode. Each present expert contributes its PPO gradient,
+  including actor entropy or the weighted critic loss, with the existing minibatch sample weighting.
+  Conflicting gradients are projected before being summed. Expert-specific layers and the optional shared output
+  head retain ordinary PPO gradients. Minibatch sampling is unchanged; absent experts contribute no gradient.
+  This option currently supports single-device, feed-forward training with `torch_compile_mode=None`.
+  It requires extra backward passes per expert and reduces gradient interference without guaranteeing fixed features.
 
 When using `"backbone"` or `"backbone+head"`, use at least two hidden dimensions so the shared backbone and expert head have valid layer sizes.

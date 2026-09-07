@@ -24,6 +24,53 @@ from moe_rsl_rl.modules import MoEModel
 class PPO(RslRlPPO):
     """RSL-RL v5.4.2 PPO with MoE model construction and auxiliary routing losses."""
 
+    def __init__(self, *args, use_pcgrad: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.use_pcgrad = use_pcgrad
+        if use_pcgrad:
+            models = [model for model in (self._raw_actor, self._raw_critic) if isinstance(model, MoEModel)]
+            if not models or any(
+                not model.mlp.use_explicit_expert
+                or not (model.mlp.use_shared_backbone or model.mlp.use_shared_backbone_and_head)
+                for model in models
+            ):
+                raise ValueError("PCGrad requires explicit routing and a shared backbone on each MoE model.")
+            if self.is_multi_gpu:
+                raise ValueError("PCGrad currently supports single-device training only.")
+            if self.actor.is_recurrent or self.critic.is_recurrent:
+                raise ValueError("PCGrad currently supports feed-forward models only.")
+
+    @staticmethod
+    def _project_conflicting_gradients(gradients: torch.Tensor) -> torch.Tensor:
+        """Return summed PCGrad gradients, projecting against the original task gradients."""
+        projected = gradients.clone()
+        for i in range(len(gradients)):
+            for j in torch.randperm(len(gradients)).tolist():
+                if i == j:
+                    continue
+                reference = gradients[j]
+                dot = torch.dot(projected[i], reference)
+                scale = dot.clamp(max=0) / reference.square().sum().clamp_min(1e-12)
+                projected[i] -= scale * reference
+        return projected.sum(dim=0)
+
+    def _pcgrad_correction(
+        self, model: MoEModel, sample_losses: torch.Tensor, expert_ids: torch.Tensor
+    ) -> list[tuple[nn.Parameter, torch.Tensor]]:
+        """Compute a backbone gradient correction while retaining the ordinary PPO weighting."""
+        parameters = [parameter for parameter in model.mlp.shared_backbone.parameters() if parameter.requires_grad]
+        if not parameters:
+            return []
+        gradients = []
+        for expert_id in expert_ids.unique():
+            # Sum / batch size preserves the original contribution of each expert's samples.
+            task_loss = sample_losses[expert_ids == expert_id].sum() / sample_losses.numel()
+            task_gradients = torch.autograd.grad(task_loss, parameters, retain_graph=True)
+            gradients.append(torch.cat([gradient.reshape(-1) for gradient in task_gradients]))
+        stacked = torch.stack(gradients)
+        correction = self._project_conflicting_gradients(stacked) - stacked.sum(dim=0)
+        return list(zip(parameters, correction.split([parameter.numel() for parameter in parameters])))
+
     def update(self) -> dict[str, float]:
         """Run PPO optimization, including optional MoE routing losses."""
         mean_value_loss = 0
@@ -111,18 +158,37 @@ class PPO(RslRlPPO):
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_samples = torch.max(surrogate, surrogate_clipped)
+            surrogate_loss = surrogate_samples.mean()
 
             # Value function loss
             if self.use_clipped_value_loss:
                 value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
                 value_losses = (values - batch.returns).pow(2)
                 value_losses_clipped = (value_clipped - batch.returns).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                value_samples = torch.max(value_losses, value_losses_clipped)
             else:
-                value_loss = (batch.returns - values).pow(2).mean()
+                value_samples = (batch.returns - values).pow(2)
+            value_loss = value_samples.mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+
+            corrections = []
+            if self.use_pcgrad:
+                for model, sample_losses in (
+                    (self._raw_actor, surrogate_samples),
+                    (self._raw_critic, self.value_loss_coef * value_samples.flatten()),
+                ):
+                    if not isinstance(model, MoEModel):
+                        continue
+                    expert_ids = model.mlp._last_gate_weights.squeeze(1).argmax(dim=-1)
+                    if model is self._raw_actor:
+                        # Entropy is evaluated only on original samples when using augmentation.
+                        entropy_samples = torch.cat((entropy, entropy.new_zeros(len(sample_losses) - len(entropy))))
+                        sample_losses = sample_losses - (
+                            self.entropy_coef * entropy_samples * len(sample_losses) / len(entropy)
+                        )
+                    corrections.extend(self._pcgrad_correction(model, sample_losses, expert_ids))
 
             # RND loss
             rnd_loss = (  # type: ignore
@@ -152,6 +218,9 @@ class PPO(RslRlPPO):
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
             loss.backward()
+            # Preserve expert heads and auxiliary-loss gradients; change only backbone PPO gradients.
+            for parameter, correction in corrections:
+                parameter.grad.add_(correction.view_as(parameter))
             # Compute the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.zero_grad()
@@ -285,6 +354,7 @@ class PPO(RslRlPPO):
         # Resolve the MoE configuration and its backwards-compatible expert-output aliases
         moe_cfg = cfg["moe_cfg"].copy()
         moe_cfg.pop("class_name", None)
+        use_pcgrad = moe_cfg.pop("use_pcgrad", False)
         who = moe_cfg.pop("who")
         if who not in {"actor", "critic", "actor+critic"}:
             raise ValueError("`moe_cfg.who` must be 'actor', 'critic', or 'actor+critic'.")
@@ -333,6 +403,10 @@ class PPO(RslRlPPO):
 
         # Initialize storage and algorithm
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
+        if use_pcgrad or cfg["algorithm"].get("use_pcgrad", False):
+            if cfg.get("torch_compile_mode") is not None:
+                raise ValueError("PCGrad currently requires torch_compile_mode=None.")
+            cfg["algorithm"]["use_pcgrad"] = True
         alg = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
