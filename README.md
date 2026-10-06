@@ -14,7 +14,7 @@ Features:
 - sparse gating
 - top-k
 - shared-layers between experts
-
+- pcgrad
 
 ## Installation
 
