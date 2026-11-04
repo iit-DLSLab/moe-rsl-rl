@@ -16,13 +16,13 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import resolve_callable, resolve_obs_groups
+from rsl_rl.utils import resolve_class, resolve_obs_groups
 
 from moe_rsl_rl.modules import MoEModel
 
 
 class PPO(RslRlPPO):
-    """RSL-RL v5.4.2 PPO with MoE model construction and auxiliary routing losses."""
+    """RSL-RL v5.5.1 PPO with MoE model construction and auxiliary routing losses."""
 
     def __init__(self, *args, use_pcgrad: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -102,118 +102,122 @@ class PPO(RslRlPPO):
             if self.symmetry:
                 self.symmetry.augment_batch(batch, original_batch_size)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: We need to do this because we updated the policy with new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
-            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-            # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
-            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
-            entropy = self.actor.output_entropy[:original_batch_size]
-
-            # Compute KL divergence and adapt the learning rate
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    if getattr(self._raw_actor, "use_log_prob_kl", False):
-                        old_actions_log_prob = batch.old_actions_log_prob.squeeze(-1)
-                        if old_actions_log_prob.shape != actions_log_prob.shape:
-                            old_actions_log_prob = old_actions_log_prob.reshape_as(actions_log_prob)
-                        kl = old_actions_log_prob - actions_log_prob.detach()
-                    else:
-                        kl = self.actor.get_kl_divergence(  # type: ignore
-                            batch.old_distribution_params, distribution_params
-                        )
-                    kl_mean = torch.mean(kl)
-
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
-
-                    # Update the learning rate only on the main process
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
-
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
-
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_samples = torch.max(surrogate, surrogate_clipped)
-            surrogate_loss = surrogate_samples.mean()
-
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                value_losses = (values - batch.returns).pow(2)
-                value_losses_clipped = (value_clipped - batch.returns).pow(2)
-                value_samples = torch.max(value_losses, value_losses_clipped)
-            else:
-                value_samples = (batch.returns - values).pow(2)
-            value_loss = value_samples.mean()
-
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
-
-            corrections = []
-            if self.use_pcgrad:
-                for model, sample_losses in (
-                    (self._raw_actor, surrogate_samples),
-                    (self._raw_critic, self.value_loss_coef * value_samples.flatten()),
-                ):
-                    if not isinstance(model, MoEModel):
-                        continue
-                    expert_ids = model.mlp._last_gate_weights.squeeze(1).argmax(dim=-1)
-                    if model is self._raw_actor:
-                        # Entropy is evaluated only on original samples when using augmentation.
-                        entropy_samples = torch.cat((entropy, entropy.new_zeros(len(sample_losses) - len(entropy))))
-                        sample_losses = sample_losses - (
-                            self.entropy_coef * entropy_samples * len(sample_losses) / len(entropy)
-                        )
-                    corrections.extend(self._pcgrad_correction(model, sample_losses, expert_ids))
-
-            # RND loss
-            rnd_loss = (  # type: ignore
-                self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None
-            )
-
-            # Symmetry loss
-            if self.symmetry:
-                symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
-                if self.symmetry.use_mirror_loss:
-                    loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
-
-            # MoE routing losses
-            moe_models = [model for model in (self._raw_actor, self._raw_critic) if isinstance(model, MoEModel)]
-            gate_models = [model for model in moe_models if model.use_gate_loss]
-            if gate_models:
-                weights = sum(
-                    (model.mlp._last_gate_weights for model in gate_models),
-                    start=torch.zeros_like(gate_models[0].mlp._last_gate_weights),
+            # Optionally use mixed precision for the forward pass and loss computation (RSL-RL v5.5.1)
+            with torch.amp.autocast(  # type: ignore
+                device_type=torch.device(self.device).type, enabled=self.use_mixed_precision, dtype=torch.bfloat16
+            ):
+                # Recompute actions log prob and entropy for current batch of transitions
+                # Note: We need to do this because we updated the policy with new parameters
+                self.actor(
+                    batch.observations,
+                    masks=batch.masks,
+                    hidden_state=batch.hidden_states[0],
+                    stochastic_output=True,
                 )
-                gate_entropy = -(weights * torch.log(weights + 1.0e-8)).sum(dim=-1).mean()
-                loss = loss - 1.0e-4 * gate_entropy
-            balance_models = [model for model in moe_models if model.use_load_balance_loss]
-            if balance_models:
-                loss = loss + 1.0e-4 * sum(model.load_balance_loss() for model in balance_models)
+                actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+                values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+                # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
+                distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+                entropy = self.actor.output_entropy[:original_batch_size]
+
+                # Compute KL divergence and adapt the learning rate
+                if self.desired_kl is not None and self.schedule == "adaptive":
+                    with torch.inference_mode():
+                        if getattr(self._raw_actor, "use_log_prob_kl", False):
+                            old_actions_log_prob = batch.old_actions_log_prob.squeeze(-1)
+                            if old_actions_log_prob.shape != actions_log_prob.shape:
+                                old_actions_log_prob = old_actions_log_prob.reshape_as(actions_log_prob)
+                            kl = old_actions_log_prob - actions_log_prob.detach()
+                        else:
+                            kl = self.actor.get_kl_divergence(  # type: ignore
+                                batch.old_distribution_params, distribution_params
+                            )
+                        kl_mean = torch.mean(kl)
+
+                        # Reduce the KL divergence across all GPUs
+                        if self.is_multi_gpu:
+                            torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                            kl_mean /= self.gpu_world_size
+
+                        # Update the learning rate only on the main process
+                        if self.gpu_global_rank == 0:
+                            if kl_mean > self.desired_kl * 2.0:
+                                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                        # Update the learning rate for all GPUs
+                        if self.is_multi_gpu:
+                            lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                            torch.distributed.broadcast(lr_tensor, src=0)
+                            self.learning_rate = lr_tensor.item()
+
+                        # Update the learning rate for all parameter groups
+                        for param_group in self.optimizer.param_groups:
+                            param_group["lr"] = self.learning_rate
+
+                # Surrogate loss
+                ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+                surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+                surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+                )
+                surrogate_samples = torch.max(surrogate, surrogate_clipped)
+                surrogate_loss = surrogate_samples.mean()
+
+                # Value function loss
+                if self.use_clipped_value_loss:
+                    value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+                    value_losses = (values - batch.returns).pow(2)
+                    value_losses_clipped = (value_clipped - batch.returns).pow(2)
+                    value_samples = torch.max(value_losses, value_losses_clipped)
+                else:
+                    value_samples = (batch.returns - values).pow(2)
+                value_loss = value_samples.mean()
+
+                loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+
+                corrections = []
+                if self.use_pcgrad:
+                    for model, sample_losses in (
+                        (self._raw_actor, surrogate_samples),
+                        (self._raw_critic, self.value_loss_coef * value_samples.flatten()),
+                    ):
+                        if not isinstance(model, MoEModel):
+                            continue
+                        expert_ids = model.mlp._last_gate_weights.squeeze(1).argmax(dim=-1)
+                        if model is self._raw_actor:
+                            # Entropy is evaluated only on original samples when using augmentation.
+                            entropy_samples = torch.cat((entropy, entropy.new_zeros(len(sample_losses) - len(entropy))))
+                            sample_losses = sample_losses - (
+                                self.entropy_coef * entropy_samples * len(sample_losses) / len(entropy)
+                            )
+                        corrections.extend(self._pcgrad_correction(model, sample_losses, expert_ids))
+
+                # RND loss
+                rnd_loss = (  # type: ignore
+                    self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None
+                )
+
+                # Symmetry loss
+                if self.symmetry:
+                    symmetry_loss = self.symmetry.compute_loss(self.actor, batch, original_batch_size)
+                    if self.symmetry.use_mirror_loss:
+                        loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
+
+                # MoE routing losses
+                moe_models = [model for model in (self._raw_actor, self._raw_critic) if isinstance(model, MoEModel)]
+                gate_models = [model for model in moe_models if model.use_gate_loss]
+                if gate_models:
+                    weights = sum(
+                        (model.mlp._last_gate_weights for model in gate_models),
+                        start=torch.zeros_like(gate_models[0].mlp._last_gate_weights),
+                    )
+                    gate_entropy = -(weights * torch.log(weights + 1.0e-8)).sum(dim=-1).mean()
+                    loss = loss - 1.0e-4 * gate_entropy
+                balance_models = [model for model in moe_models if model.use_load_balance_loss]
+                if balance_models:
+                    loss = loss + 1.0e-4 * sum(model.load_balance_loss() for model in balance_models)
 
             # Compute the gradients for PPO
             self.optimizer.zero_grad()
@@ -248,6 +252,14 @@ class PPO(RslRlPPO):
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+
+        # Update the normalizers. Since RSL-RL v5.5.1 this happens here, over the whole collected rollout, and no
+        # longer at every environment step in process_env_step
+        obs = self.storage.observations.flatten(0, 1)
+        self.actor.update_normalization(obs)  # type: ignore
+        self.critic.update_normalization(obs)  # type: ignore
+        if self.rnd:
+            self.rnd.update_normalization(obs)  # type: ignore
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -333,23 +345,26 @@ class PPO(RslRlPPO):
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
         """Construct PPO using MoE models on the configured actor and/or critic side."""
-        # Resolve class callables
-        algorithm_name = cfg["algorithm"].pop("class_name")
-        alg_class: type[PPO] = PPO if algorithm_name == "PPO" else resolve_callable(algorithm_name)  # type: ignore
-        actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
-        critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
+        # Resolve class callables and configs. As in RSL-RL v5.5.1, the sub-configs are deep copies with
+        # ``class_name`` removed, so ``cfg`` keeps its class names (the runner and the logger read them).
+        algorithm_name = cfg["algorithm"]["class_name"]
+        alg_class, alg_cfg = resolve_class(cfg["algorithm"])
+        if algorithm_name == "PPO":
+            alg_class = PPO
+        actor_class, actor_cfg = resolve_class(cfg["actor"])
+        critic_class, critic_cfg = resolve_class(cfg["critic"])
 
         # Resolve observation groups
         default_sets = ["actor", "critic"]
-        if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
+        if "rnd_cfg" in alg_cfg and alg_cfg["rnd_cfg"] is not None:
             default_sets.append("rnd_state")
         cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
 
         # Resolve RND config if used
-        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
+        alg_cfg = resolve_rnd_config(alg_cfg, obs, cfg["obs_groups"], env)
 
         # Resolve symmetry config if used
-        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+        alg_cfg = resolve_symmetry_config(alg_cfg, env)
 
         # Resolve the MoE configuration and its backwards-compatible expert-output aliases
         moe_cfg = cfg["moe_cfg"].copy()
@@ -375,16 +390,16 @@ class PPO(RslRlPPO):
                 cfg["obs_groups"],
                 "actor",
                 env.num_actions,
-                **cfg["actor"],
+                **actor_cfg,
                 **moe_cfg,
                 expert_output_dims=expert_output_dims,
             ).to(device)
         else:
-            actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
+            actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         print(f"Actor Model: {actor}")
 
         # Initialize the critic
-        if cfg["algorithm"].pop("share_cnn_encoders", None):
+        if alg_cfg.pop("share_cnn_encoders", None):
             raise ValueError("`share_cnn_encoders` is not supported by MoE models.")
         if "critic" in who:
             critic_moe_cfg = moe_cfg.copy()
@@ -394,20 +409,20 @@ class PPO(RslRlPPO):
                 cfg["obs_groups"],
                 "critic",
                 1,
-                **cfg["critic"],
+                **critic_cfg,
                 **critic_moe_cfg,
             ).to(device)
         else:
-            critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
+            critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
         print(f"Critic Model: {critic}")
 
         # Initialize storage and algorithm
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
-        if use_pcgrad or cfg["algorithm"].get("use_pcgrad", False):
+        if use_pcgrad or alg_cfg.get("use_pcgrad", False):
             if cfg.get("torch_compile_mode") is not None:
                 raise ValueError("PCGrad currently requires torch_compile_mode=None.")
-            cfg["algorithm"]["use_pcgrad"] = True
-        alg = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
+            alg_cfg["use_pcgrad"] = True
+        alg = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
         alg.compile(cfg.get("torch_compile_mode"))

@@ -58,7 +58,7 @@ def make_cfg(
     gaussian_mixture: bool = False,
     expert_output_dims: list[int] | None = None,
 ) -> dict:
-    """Return a minimal RSL-RL 5.4.2 MoE configuration."""
+    """Return a minimal RSL-RL 5.5.1 MoE configuration."""
     return {
         "num_steps_per_env": 4,
         "save_interval": 100,
@@ -124,7 +124,7 @@ def run_update(algorithm: PPO, env: DummyEnv) -> dict[str, float]:
 
 
 class TestRslRlV5Compatibility(unittest.TestCase):
-    """Regression coverage for the RSL-RL 5.4.2 integration."""
+    """Regression coverage for the RSL-RL 5.5.1 integration."""
 
     def test_pcgrad_projection(self) -> None:
         gradients = torch.tensor([[1.0, 0.0], [-1.0, 1.0]])

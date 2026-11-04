@@ -21,7 +21,9 @@ class MoEOnPolicyRunner(OnPolicyRunner):
         """Use the local PPO for MoE configs, then delegate all runner behavior to RSL-RL."""
         # Select the MoE-aware algorithm while keeping the standard RSL-RL configuration shape
         if "moe_cfg" in train_cfg:
-            train_cfg["algorithm"]["class_name"] = MoEPPO
+            # RSL-RL v5.5.1 keeps class_name in the train cfg, which the logger stores (e.g. in the W&B config),
+            # so set it as an importable path rather than as a class object
+            train_cfg["algorithm"]["class_name"] = f"{MoEPPO.__module__}:{MoEPPO.__qualname__}"
 
         # Delegate construction, learning, logging, checkpoints, and exports to the upstream runner
         super().__init__(env, train_cfg, log_dir, device)

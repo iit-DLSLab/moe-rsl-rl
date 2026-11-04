@@ -28,7 +28,7 @@ moe_rsl_rl/
     ac_moe_gated.py           # Learned-gate MoE network, with optional top-k sparse routing.
     ac_moe_explicit.py        # Hard-routed MoE network using the last observation entry as expert id.
   runners/
-    moe_on_policy_runner.py   # Upstream v5.4.2 runner with local PPO selection for MoE configs.
+    moe_on_policy_runner.py   # Upstream v5.5.1 runner with local PPO selection for MoE configs.
 example/
   moe_cfg.py                  # Example MoE configuration.
   rsl_rl_ppo_cfg.py           # Example RSL-RL v5 actor/critic and PPO configuration.
@@ -71,7 +71,7 @@ train_cfg = {
 The important parts are:
 
 - `actor` and `critic` use the standard RSL-RL v5 model configuration shape.
-- `algorithm["class_name"] == "PPO"` selects this package's RSL-RL 5.4.2-compatible PPO in the MoE runner.
+- `algorithm["class_name"] == "PPO"` selects this package's RSL-RL 5.5.1-compatible PPO in the MoE runner.
 - `moe_cfg["who"]` makes the actor, critic, or both use `MoEModel`.
 
 ## Choose a Workflow
@@ -139,7 +139,7 @@ from moe_rsl_rl.runners.moe_on_policy_runner import MoEOnPolicyRunner
 runner = MoEOnPolicyRunner(env, train_cfg, log_dir=log_dir, device=device)
 ```
 
-The runner is kept aligned with RSL-RL 5.4.2. Its MoE-specific behavior is deliberately limited to:
+The runner is kept aligned with RSL-RL 5.5.1. Its MoE-specific behavior is deliberately limited to:
 
 - selecting this repository's local `PPO` when a top-level `moe_cfg` is present
 - exposing the class as `MoEOnPolicyRunner`
