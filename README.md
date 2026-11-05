@@ -3,7 +3,7 @@
   <img src="https://img.shields.io/badge/rsl_rl%20-v5.5.1-brown" alt="rsl-rl v5.5.1" style="margin-bottom: 1px;">
 </div>
 
-# moe-rsl-rl
+# Overview
 moe-rsl-rl is a reinforcement learning library that extends the Proximal Policy Optimization (PPO) implementation of [RSL-RL](https://github.com/leggedrobotics/rsl_rl) to incorporate [Mixture-of-Experts](https://www.cs.toronto.edu/~fritz/absps/jjnh91.pdf) (MoE).
 
 Features:
