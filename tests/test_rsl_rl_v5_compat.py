@@ -87,16 +87,19 @@ def make_cfg(
             "schedule": "adaptive",
         },
         "moe_cfg": {
-            "who": who,
-            "num_experts": 3,
-            "gate_hidden_dims": [8],
-            "top_k": 2,
-            "use_gate_loss": True,
-            "use_load_balance_loss": True,
-            "use_explicit_expert": explicit,
-            "use_shared_layers": False,
-            "expert_output_dims": expert_output_dims,
-            "use_gaussian_mixture": gaussian_mixture,
+            "decomposition": "state",
+            "state_decomposition_cfg": {
+                "who": who,
+                "num_experts": 3,
+                "gate_hidden_dims": [8],
+                "top_k": 2,
+                "use_gate_loss": True,
+                "use_load_balance_loss": True,
+                "use_explicit_expert": explicit,
+                "use_shared_layers": False,
+                "expert_output_dims": expert_output_dims,
+                "use_gaussian_mixture": gaussian_mixture,
+            },
         },
     }
 
@@ -142,7 +145,7 @@ class TestRslRlV5Compatibility(unittest.TestCase):
             for sharing in ("backbone", "backbone+head"):
                 with self.subTest(who=who, sharing=sharing):
                     cfg = make_cfg(who, explicit=True)
-                    cfg["moe_cfg"].update(use_shared_layers=sharing, use_pcgrad=True)
+                    cfg["moe_cfg"]["state_decomposition_cfg"].update(use_shared_layers=sharing, use_pcgrad=True)
                     algorithm = build_algorithm(env, cfg)
                     self.assertTrue(algorithm.use_pcgrad)
                     models = [m for m in (algorithm.actor, algorithm.critic) if isinstance(m, MoEModel)]
@@ -159,7 +162,7 @@ class TestRslRlV5Compatibility(unittest.TestCase):
     def test_pcgrad_preserves_head_gradients(self) -> None:
         env = DummyEnv()
         cfg = make_cfg("actor", explicit=True)
-        cfg["moe_cfg"].update(use_shared_layers="backbone", use_pcgrad=True)
+        cfg["moe_cfg"]["state_decomposition_cfg"].update(use_shared_layers="backbone", use_pcgrad=True)
         algorithm = build_algorithm(env, cfg)
         model = algorithm.actor
         output = model(env.get_observations(), stochastic_output=False)
@@ -188,7 +191,7 @@ class TestRslRlV5Compatibility(unittest.TestCase):
     def test_pcgrad_rejects_unsupported_topologies(self) -> None:
         for explicit, sharing in ((False, "backbone"), (True, False)):
             cfg = make_cfg(explicit=explicit)
-            cfg["moe_cfg"].update(use_shared_layers=sharing, use_pcgrad=True)
+            cfg["moe_cfg"]["state_decomposition_cfg"].update(use_shared_layers=sharing, use_pcgrad=True)
             with self.assertRaisesRegex(ValueError, "explicit routing and a shared backbone"):
                 build_algorithm(DummyEnv(), cfg)
 

@@ -8,8 +8,10 @@
 from .ac_moe import MoEDistribution, MoEModel, MoE_net
 from .ac_moe_explicit import ExplicitExpertMoENet
 from .ac_moe_gated import GatedMoENet
+from .reward_decomposition import RewardDecompositionCritic
 
 __all__ = [
+    "RewardDecompositionCritic",
     "MoEModel",
     "MoEDistribution",
     "MoE_net",

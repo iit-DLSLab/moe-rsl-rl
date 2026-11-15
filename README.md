@@ -15,6 +15,7 @@ Features:
 - top-k
 - shared-layers between experts
 - pcgrad
+- reward decomposition / multi-critic (one critic per reward group)
 
 ## Installation
 

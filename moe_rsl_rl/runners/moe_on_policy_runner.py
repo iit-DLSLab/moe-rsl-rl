@@ -18,9 +18,9 @@ class MoEOnPolicyRunner(OnPolicyRunner):
     """RSL-RL on-policy runner selecting the MoE-aware PPO implementation."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
-        """Use the local PPO for MoE configs, then delegate all runner behavior to RSL-RL."""
+        """Use the local PPO for MoE configs (state/reward decomposition), then delegate to the RSL-RL runner."""
         # Select the MoE-aware algorithm while keeping the standard RSL-RL configuration shape
-        if "moe_cfg" in train_cfg:
+        if train_cfg.get("moe_cfg") is not None:
             # RSL-RL v5.5.1 keeps class_name in the train cfg, which the logger stores (e.g. in the W&B config),
             # so set it as an importable path rather than as a class object
             train_cfg["algorithm"]["class_name"] = f"{MoEPPO.__module__}:{MoEPPO.__qualname__}"
