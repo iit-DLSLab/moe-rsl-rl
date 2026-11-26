@@ -36,6 +36,9 @@ class StateDecompositionCfg:
     use_pcgrad = False
     """Project conflicting expert gradients on shared backbones (requires explicit routing)."""
 
+    log_gradient_conflict = False
+    """Log how much the expert gradients on the shared backbone conflict (grad_conflict/* in the logger)."""
+
     expert_output_dims = None
     """The output dimensions of each expert, which will be concatenated to form the final output"""
 
@@ -99,6 +102,7 @@ moe_cfg = MoECfg(
         use_explicit_expert = True,
         use_shared_layers = "backbone",
         use_pcgrad = False,
+        log_gradient_conflict = False,
         expert_output_dims = [12, 9, 9, 6],
     ),
     # Used with decomposition = "reward" or "state+reward": one critic for the feet rewards, one for everything else

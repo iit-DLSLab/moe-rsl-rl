@@ -195,6 +195,32 @@ class TestRslRlV5Compatibility(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "explicit routing and a shared backbone"):
                 build_algorithm(DummyEnv(), cfg)
 
+    def test_gradient_conflict_stats(self) -> None:
+        stats = PPO._gradient_conflict_stats(torch.tensor([[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0]]))
+        self.assertAlmostEqual(stats["cos_mean"], -1.0 / 3.0, places=5)
+        self.assertAlmostEqual(stats["cos_min"], -1.0, places=5)
+        self.assertAlmostEqual(stats["conflict_frac"], 1.0 / 3.0, places=5)
+        self.assertIsNone(PPO._gradient_conflict_stats(torch.tensor([[1.0, 2.0]])))
+        aligned = PPO._gradient_conflict_stats(torch.tensor([[1.0, 0.0], [2.0, 1.0]]))
+        self.assertEqual(aligned["conflict_frac"], 0.0)
+        self.assertAlmostEqual(aligned["pcgrad_change"], 0.0, places=6)
+
+    def test_gradient_conflict_logging(self) -> None:
+        env = DummyEnv()
+        for use_pcgrad in (False, True):
+            with self.subTest(use_pcgrad=use_pcgrad):
+                cfg = make_cfg("actor+critic", explicit=True)
+                cfg["moe_cfg"]["state_decomposition_cfg"].update(
+                    use_shared_layers="backbone", use_pcgrad=use_pcgrad, log_gradient_conflict=True
+                )
+                algorithm = build_algorithm(env, cfg)
+                self.assertEqual(algorithm.use_pcgrad, use_pcgrad)
+                losses = run_update(algorithm, env)
+                for model_name in ("actor", "critic"):
+                    for stat in ("cos_mean", "cos_min", "conflict_frac", "pcgrad_change"):
+                        value = losses[f"grad_conflict/{model_name}/{stat}"]
+                        self.assertTrue(torch.isfinite(torch.tensor(value)))
+
     def test_pcgrad_defaults_to_disabled(self) -> None:
         self.assertFalse(build_algorithm(DummyEnv(), make_cfg()).use_pcgrad)
 

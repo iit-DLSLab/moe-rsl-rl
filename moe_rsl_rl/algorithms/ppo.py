@@ -37,6 +37,7 @@ class PPO(RslRlPPO):
         self,
         *args,
         use_pcgrad: bool = False,
+        log_gradient_conflict: bool = False,
         reward_groups: dict[str, list[str]] | None = None,
         reward_group_weights: list[float] | None = None,
         normalize_group_advantages: bool = False,
@@ -69,18 +70,20 @@ class PPO(RslRlPPO):
             self._reward_term_to_group: torch.Tensor | None = None
 
         self.use_pcgrad = use_pcgrad
-        if use_pcgrad:
+        self.log_gradient_conflict = log_gradient_conflict
+        if use_pcgrad or log_gradient_conflict:
+            what = "PCGrad" if use_pcgrad else "Gradient-conflict logging"
             models = self._moe_models()
             if not models or any(
                 not model.mlp.use_explicit_expert
                 or not (model.mlp.use_shared_backbone or model.mlp.use_shared_backbone_and_head)
                 for model in models
             ):
-                raise ValueError("PCGrad requires explicit routing and a shared backbone on each MoE model.")
-            if self.is_multi_gpu:
+                raise ValueError(f"{what} requires explicit routing and a shared backbone on each MoE model.")
+            if use_pcgrad and self.is_multi_gpu:
                 raise ValueError("PCGrad currently supports single-device training only.")
             if self.actor.is_recurrent or self.critic.is_recurrent:
-                raise ValueError("PCGrad currently supports feed-forward models only.")
+                raise ValueError(f"{what} currently supports feed-forward models only.")
 
     @property
     def use_reward_decomposition(self) -> bool:
@@ -210,22 +213,60 @@ class PPO(RslRlPPO):
                 projected[i] -= scale * reference
         return projected.sum(dim=0)
 
-    def _pcgrad_correction(
-        self, model: MoEModel, sample_losses: torch.Tensor, expert_ids: torch.Tensor
-    ) -> list[tuple[nn.Parameter, torch.Tensor]]:
-        """Compute a backbone gradient correction while retaining the ordinary PPO weighting."""
+    @staticmethod
+    def _expert_backbone_gradients(
+        model: MoEModel, sample_losses: torch.Tensor, expert_ids: torch.Tensor
+    ) -> tuple[list[nn.Parameter], torch.Tensor | None]:
+        """Return the shared-backbone parameters and one flattened backbone gradient per routed expert."""
         parameters = [parameter for parameter in model.mlp.shared_backbone.parameters() if parameter.requires_grad]
         if not parameters:
-            return []
+            return parameters, None
         gradients = []
         for expert_id in expert_ids.unique():
             # Sum / batch size preserves the original contribution of each expert's samples.
             task_loss = sample_losses[expert_ids == expert_id].sum() / sample_losses.numel()
             task_gradients = torch.autograd.grad(task_loss, parameters, retain_graph=True)
             gradients.append(torch.cat([gradient.reshape(-1) for gradient in task_gradients]))
-        stacked = torch.stack(gradients)
+        return parameters, torch.stack(gradients)
+
+    def _pcgrad_correction(
+        self, model: MoEModel, sample_losses: torch.Tensor, expert_ids: torch.Tensor
+    ) -> list[tuple[nn.Parameter, torch.Tensor]]:
+        """Compute a backbone gradient correction while retaining the ordinary PPO weighting."""
+        parameters, stacked = self._expert_backbone_gradients(model, sample_losses, expert_ids)
+        if stacked is None:
+            return []
+        return self._pcgrad_correction_from_gradients(parameters, stacked)
+
+    def _pcgrad_correction_from_gradients(
+        self, parameters: list[nn.Parameter], stacked: torch.Tensor
+    ) -> list[tuple[nn.Parameter, torch.Tensor]]:
         correction = self._project_conflicting_gradients(stacked) - stacked.sum(dim=0)
         return list(zip(parameters, correction.split([parameter.numel() for parameter in parameters])))
+
+    @classmethod
+    @torch.no_grad()
+    def _gradient_conflict_stats(cls, gradients: torch.Tensor) -> dict[str, float] | None:
+        """Measure how much the per-expert backbone gradients conflict.
+
+        - ``cos_mean`` / ``cos_min``: mean and minimum pairwise cosine similarity between expert gradients.
+        - ``conflict_frac``: fraction of expert pairs with negative cosine similarity (the pairs PCGrad projects).
+        - ``pcgrad_change``: ``||PCGrad(g) - sum(g)|| / ||sum(g)||``, i.e. how much PCGrad would alter the update.
+        """
+        if len(gradients) < 2:
+            return None
+        gradients = gradients.float()
+        unit = gradients / gradients.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        i, j = torch.triu_indices(len(gradients), len(gradients), offset=1, device=gradients.device)
+        cos = (unit @ unit.T)[i, j]
+        total = gradients.sum(dim=0)
+        change = (cls._project_conflicting_gradients(gradients) - total).norm() / total.norm().clamp_min(1e-12)
+        return {
+            "cos_mean": cos.mean().item(),
+            "cos_min": cos.min().item(),
+            "conflict_frac": (cos < 0).float().mean().item(),
+            "pcgrad_change": change.item(),
+        }
 
     def update(self) -> dict[str, float]:
         """Run PPO optimization, including optional MoE routing losses."""
@@ -238,6 +279,9 @@ class PPO(RslRlPPO):
         mean_symmetry_loss = 0 if self.symmetry else None
         # Per-critic value losses
         mean_group_value_losses = 0 if self.use_reward_decomposition else None
+        # Gradient-conflict statistics between experts on the shared backbones
+        conflict_sums: dict[str, float] = {}
+        conflict_counts: dict[str, int] = {}
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -246,7 +290,7 @@ class PPO(RslRlPPO):
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over mini-batches
-        for batch in generator:
+        for batch_idx, batch in enumerate(generator):
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini-batch
@@ -337,12 +381,21 @@ class PPO(RslRlPPO):
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
                 corrections = []
-                if self.use_pcgrad:
-                    for model, sample_losses in (
-                        (self._raw_actor, surrogate_samples),
+                # Without PCGrad, the extra backward passes for the conflict statistics run on the first mini-batch
+                # only; with PCGrad, the per-expert gradients are computed anyway and every mini-batch is measured.
+                measure_conflict = self.log_gradient_conflict and (self.use_pcgrad or batch_idx == 0)
+                if self.use_pcgrad or measure_conflict:
+                    critic_models = self._critic_models()
+                    critic_names = (
+                        [f"critic_{name}" for name in self.reward_group_names]  # type: ignore[union-attr]
+                        if self.use_reward_decomposition
+                        else ["critic"] * len(critic_models)
+                    )
+                    for model_name, model, sample_losses in (
+                        ("actor", self._raw_actor, surrogate_samples),
                         *(
-                            (critic, self.value_loss_coef * value_samples[..., k].flatten())
-                            for k, critic in enumerate(self._critic_models())
+                            (critic_names[k], critic, self.value_loss_coef * value_samples[..., k].flatten())
+                            for k, critic in enumerate(critic_models)
                         ),
                     ):
                         if not isinstance(model, MoEModel):
@@ -354,7 +407,17 @@ class PPO(RslRlPPO):
                             sample_losses = sample_losses - (
                                 self.entropy_coef * entropy_samples * len(sample_losses) / len(entropy)
                             )
-                        corrections.extend(self._pcgrad_correction(model, sample_losses, expert_ids))
+                        parameters, stacked = self._expert_backbone_gradients(model, sample_losses, expert_ids)
+                        if stacked is None:
+                            continue
+                        if measure_conflict:
+                            stats = self._gradient_conflict_stats(stacked)
+                            for stat_name, value in (stats or {}).items():
+                                key = f"grad_conflict/{model_name}/{stat_name}"
+                                conflict_sums[key] = conflict_sums.get(key, 0.0) + value
+                                conflict_counts[key] = conflict_counts.get(key, 0) + 1
+                        if self.use_pcgrad:
+                            corrections.extend(self._pcgrad_correction_from_gradients(parameters, stacked))
 
                 # RND loss
                 rnd_loss = (  # type: ignore
@@ -451,6 +514,9 @@ class PPO(RslRlPPO):
             for name, group_loss in zip(self.reward_group_names, (mean_group_value_losses / num_updates).tolist()):  # type: ignore[arg-type]
                 loss_dict[f"value_{name}"] = group_loss
 
+        for key, value in conflict_sums.items():
+            loss_dict[key] = value / conflict_counts[key]
+
         # Clear the storage
         self.storage.clear()
 
@@ -539,6 +605,8 @@ class PPO(RslRlPPO):
         # and/or critic) and the reward decomposition (one critic per group of reward terms)
         expert_cfg, reward_decomposition = PPO._resolve_moe_cfg(cfg.get("moe_cfg"))
         use_pcgrad = expert_cfg.pop("use_pcgrad", False)
+        if expert_cfg.pop("log_gradient_conflict", False):
+            alg_cfg["log_gradient_conflict"] = True
         who = expert_cfg.pop("who", "")
         use_moe = bool(who)
         expert_output_dims = expert_cfg.pop("expert_output_dims", None)
@@ -601,9 +669,10 @@ class PPO(RslRlPPO):
 
         # Initialize the algorithm
         if use_pcgrad or alg_cfg.get("use_pcgrad", False):
-            if cfg.get("torch_compile_mode") is not None:
-                raise ValueError("PCGrad currently requires torch_compile_mode=None.")
             alg_cfg["use_pcgrad"] = True
+        if alg_cfg.get("use_pcgrad", False) or alg_cfg.get("log_gradient_conflict", False):
+            if cfg.get("torch_compile_mode") is not None:
+                raise ValueError("PCGrad and gradient-conflict logging currently require torch_compile_mode=None.")
         alg = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
